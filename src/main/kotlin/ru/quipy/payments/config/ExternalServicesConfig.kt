@@ -3,7 +3,9 @@ package ru.quipy.payments.config
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
 import ru.quipy.payments.logic.ExternalServiceProperties
+import ru.quipy.payments.logic.PaymentExternalService
 import ru.quipy.payments.logic.PaymentExternalServiceImpl
+import ru.quipy.payments.logic.PaymentService
 import java.time.Duration
 
 
@@ -53,8 +55,10 @@ class ExternalServicesConfig {
     }
 
     @Bean(PRIMARY_PAYMENT_BEAN)
-    fun fastExternalService() =
-        PaymentExternalServiceImpl(
-            accountProps_4,
-        )
+    fun fastExternalService(): PaymentService {
+        val service2 = PaymentExternalServiceImpl(accountProps_2)
+        val service1 = PaymentExternalServiceImpl(accountProps_1)
+        service2.setNext(service1)
+        return service2
+    }
 }
