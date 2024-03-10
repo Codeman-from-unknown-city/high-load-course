@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import okhttp3.*
 import org.slf4j.LoggerFactory
-import org.springframework.beans.factory.annotation.Autowired
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.RateLimiter
 import ru.quipy.core.EventSourcingService
@@ -13,12 +12,12 @@ import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
-import java.util.concurrent.Executors
 
 
 // Advice: always treat time as a Duration
 class PaymentExternalServiceImpl(
-    private val properties: ExternalServiceProperties,
+    private var paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
+    properties: ExternalServiceProperties,
 ) : PaymentExternalService {
 
     companion object {
@@ -44,27 +43,45 @@ class PaymentExternalServiceImpl(
         this.next = next
     }
 
-    @Autowired
-    private lateinit var paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
-
-    private val httpClientExecutor = Executors.newSingleThreadExecutor()
-
-    private val client = OkHttpClient.Builder().run {
-        dispatcher(Dispatcher(httpClientExecutor))
-        build()
+    private fun cancelPayment(paymentId: UUID, paymentStartedAt: Long) {
+        val transactionId = UUID.randomUUID()
+        paymentESService.update(paymentId) {
+            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+        }
+        paymentESService.update(paymentId) {
+            it.logProcessing(false, now(), transactionId, reason = "Canceled.")
+        }
     }
 
     override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long) {
+        if (Duration.ofMillis(now() - paymentStartedAt) + requestAverageProcessingTime > paymentOperationTimeout) {
+            logger.warn("[$accountName] Cannot process request due to SLA")
+            if (next == null) {
+                cancelPayment(paymentId, paymentStartedAt)
+            } else {
+                next!!.submitPaymentRequest(paymentId, amount, paymentStartedAt)
+            }
+            return
+        }
+
         if (!ongoingWindow.tryAcquire()) {
-            logger.warn("[$accountName] Reached limit of parallel jobs")
-            next?.submitPaymentRequest(paymentId, amount, paymentStartedAt)
+            logger.warn("[$accountName] Reached limit of parallel requests")
+            if (next == null) {
+                cancelPayment(paymentId, paymentStartedAt)
+            } else {
+                next!!.submitPaymentRequest(paymentId, amount, paymentStartedAt)
+            }
             return
         }
 
         if (!rateLimiter.tick()) {
             ongoingWindow.release()
-            logger.warn("[$accountName] Reached RPS")
-            next?.submitPaymentRequest(paymentId, amount, paymentStartedAt)
+            logger.warn("[$accountName] Reached limit of RPS")
+            if (next == null) {
+                cancelPayment(paymentId, paymentStartedAt)
+            } else {
+                next!!.submitPaymentRequest(paymentId, amount, paymentStartedAt)
+            }
             return
         }
 
@@ -84,9 +101,13 @@ class PaymentExternalServiceImpl(
             post(emptyBody)
         }.build()
 
-        client.newCall(request).enqueue(
+        OkHttpClient.Builder().run {
+            callTimeout(paymentOperationTimeout - Duration.ofMillis(now() - paymentStartedAt))
+            build()
+        }.newCall(request).enqueue(
             object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
+                    ongoingWindow.release()
                     logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
                     when (e) {
                         is SocketTimeoutException -> {
@@ -101,10 +122,10 @@ class PaymentExternalServiceImpl(
                             }
                         }
                     }
-                    ongoingWindow.release()
                 }
 
                 override fun onResponse(call: Call, response: Response) {
+                    ongoingWindow.release()
                     val body = try {
                         mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
                     } catch (e: Exception) {
@@ -119,7 +140,6 @@ class PaymentExternalServiceImpl(
                     paymentESService.update(paymentId) {
                         it.logProcessing(body.result, now(), transactionId, reason = body.message)
                     }
-                    ongoingWindow.release()
                 }
             }
         )
